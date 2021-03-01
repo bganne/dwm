@@ -226,6 +226,8 @@ static void updatetitle(Client *c);
 static void updatewindowtype(Client *c);
 static void updatewmhints(Client *c);
 static void view(const Arg *arg);
+static void viewnext(const Arg *arg);
+static void viewprev(const Arg *arg);
 static Client *wintoclient(Window w);
 static Monitor *wintomon(Window w);
 static int xerror(Display *dpy, XErrorEvent *ee);
@@ -2059,6 +2061,20 @@ view(const Arg *arg)
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
 	focus(NULL);
 	arrange(selmon);
+}
+
+void
+viewnext(const Arg *arg) {
+#define rotate_left(v, n)       ((((v) << (n))|((v) >> (LENGTH(tags) - (n)))) & TAGMASK)
+        Arg a = { .ui = rotate_left(selmon->tagset[selmon->seltags], 1) };
+        view(&a);
+}
+
+void
+viewprev(const Arg *arg) {
+#define rotate_right(v, n)       ((((v) >> (n))|((v) << (LENGTH(tags) - (n)))) & TAGMASK)
+        Arg a = { .ui = rotate_right(selmon->tagset[selmon->seltags], 1) };
+        view(&a);
 }
 
 Client *
