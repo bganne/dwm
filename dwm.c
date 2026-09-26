@@ -29,7 +29,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <X11/cursorfont.h>
@@ -101,7 +100,8 @@ struct Client {
 	Monitor *mon;
 	Window win;
 	pid_t pgid;
-	int suspendstate;
+	long hiddenat; /* ms, 0 if visible */
+	int stopped;
 };
 
 typedef struct {
@@ -268,7 +268,7 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[UnmapNotify] = unmapnotify
 };
 static Atom wmatom[WMLast], netatom[NetLast];
-static int running = 1;
+static volatile sig_atomic_t running = 1;
 static Cur *cursor[CurLast];
 static Clr **scheme;
 static Display *dpy;
@@ -278,15 +278,6 @@ static Window root, wmcheckwin;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
-
-typedef enum {
-	ALWAYS_ON  = 0,
-	RUNNING    = 1,
-	STEPPING_1 = 2,
-	STEPPING_2 = 3,
-	PAUSED     = 4,
-	PAUSED_END = SUSPEND_PAUSED/SUSPEND_RUN+4,
-} Suspendstate;
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -1079,7 +1070,8 @@ initsuspend(Client *c)
 	int i;
 
 	c->pgid = -1;
-	c->suspendstate = ALWAYS_ON;
+	c->hiddenat = 0;
+	c->stopped = 0;
 
 	XGetClassHint(dpy, c->win, &ch);
 	class    = ch.res_class ? ch.res_class : broken;
@@ -1091,8 +1083,9 @@ initsuspend(Client *c)
 		&& (!r->class || strstr(class, r->class))
 		&& (!r->instance || strstr(instance, r->instance))) {
 			c->pgid = winpgid(c->win);
-			if (c->pgid > 0)
-				c->suspendstate = RUNNING;
+			/* never signal init's or our own process group */
+			if (c->pgid <= 1 || c->pgid == getpgrp())
+				c->pgid = -1;
 			break;
 		}
 	}
@@ -1101,6 +1094,59 @@ initsuspend(Client *c)
 		XFree(ch.res_class);
 	if (ch.res_name)
 		XFree(ch.res_name);
+}
+
+static long
+nowms(void)
+{
+	struct timespec ts;
+
+	/* CLOCK_BOOTTIME: monotonic and keeps counting during system sleep */
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void
+setgroupstopped(pid_t pgid, int stopped)
+{
+	Monitor *m;
+	Client *c;
+
+	for (m = mons; m; m = m->next)
+		for (c = m->clients; c; c = c->next)
+			if (c->pgid == pgid)
+				c->stopped = stopped;
+}
+
+static int
+groupvisible(pid_t pgid)
+{
+	Monitor *m;
+	Client *c;
+
+	for (m = mons; m; m = m->next)
+		for (c = m->clients; c; c = c->next)
+			if (c->pgid == pgid && !c->hiddenat)
+				return 1;
+	return 0;
+}
+
+static void
+stopclient(Client *c)
+{
+	if (c->pgid <= 0 || c->stopped)
+		return;
+	kill(-c->pgid, SIGSTOP);
+	setgroupstopped(c->pgid, 1);
+}
+
+static void
+contclient(Client *c)
+{
+	if (c->pgid <= 0 || !c->stopped)
+		return;
+	kill(-c->pgid, SIGCONT);
+	setgroupstopped(c->pgid, 0);
 }
 
 void
@@ -1455,48 +1501,38 @@ restack(Monitor *m)
 	while (XCheckMaskEvent(dpy, EnterWindowMask, &ev));
 }
 
-static void
+/* Hidden suspendable clients are stopped, but all of them are resumed
+ * together for SUSPEND_RUN ms every SUSPEND_PERIOD ms so they can still
+ * serve clipboard and D-Bus requests.
+ * Returns the time in ms until the next phase change, -1 if none. */
+static long
 runsuspend(void)
 {
-	static struct timeval next = {0};
-	struct timeval now;
-	time_t ticks;
+	static int paused = 0;
+	static long next = 0;
+	long now = nowms();
+	int active = 0;
 	Monitor *m;
 	Client *c;
 
-	if (gettimeofday(&now, NULL)) {
-		perror("gettimeofday() failed");
-		return;
+	if (now >= next) {
+		paused = !paused;
+		next = now + (paused ? SUSPEND_PERIOD - SUSPEND_RUN : SUSPEND_RUN);
 	}
-
-	if (next.tv_sec > now.tv_sec)
-		return; /* not time yet */
-
-	/* if the system was put to sleep we can miss several ticks
-	 * in case of brutal time change (ntp...), the time tracking
-	 * will be wrong but will sync again on next iteration */
-	ticks = (now.tv_sec - next.tv_sec + SUSPEND_RUN)/SUSPEND_RUN;
-	ticks = MIN(ticks, PAUSED_END - STEPPING_1); /* do not overflow */
-	next = now;
-	next.tv_sec += SUSPEND_RUN; /* wakeup in 30s */
 
 	for (m = mons; m; m = m->next) {
 		for (c = m->clients; c; c = c->next) {
-			if (c->suspendstate >= STEPPING_1) {
-				c->suspendstate += ticks;
-			}
-			if (c->suspendstate == PAUSED) {
-				kill(-c->pgid, SIGSTOP); /* go to sleep */
-			} else if (c->suspendstate >= PAUSED_END) {
-				/* wake up
-				 * in case we went from STEPPING_1 to PAUSED_END
-				 * directly because of too many ticks missed, we'll
-				 * send a spurious SIGCONT, but who cares? */
-				kill(-c->pgid, SIGCONT);
-				c->suspendstate = STEPPING_2;
-			}
+			if (c->pgid <= 0 || !c->hiddenat)
+				continue;
+			active = 1;
+			if (!paused)
+				contclient(c);
+			else if (now - c->hiddenat >= SUSPEND_GRACE && !groupvisible(c->pgid))
+				stopclient(c);
 		}
 	}
+
+	return active ? next - now : -1;
 }
 
 static void
@@ -1504,10 +1540,10 @@ unsuspend(void)
 {
 	Monitor *m;
 	Client *c;
+
 	for (m = mons; m; m = m->next)
 		for (c = m->clients; c; c = c->next)
-			if (c->suspendstate >= PAUSED)
-				kill(-c->pgid, SIGCONT);
+			contclient(c);
 }
 
 void
@@ -1516,6 +1552,7 @@ run(void)
 	XEvent ev;
 	fd_set fds;
 	int fd;
+	long ms;
 	struct timeval tv;
 
 	XSync(dpy, False);
@@ -1524,18 +1561,19 @@ run(void)
 
 	/* main event loop */
 	while (running) {
+		while (running && XPending(dpy))
+			if (XNextEvent(dpy, &ev))
+				running = 0; /* exit on error */
+			else if (handler[ev.type])
+				handler[ev.type](&ev); /* call handler */
+		if (!running)
+			break;
+		ms = runsuspend();
+		tv.tv_sec = ms / 1000;
+		tv.tv_usec = ms % 1000 * 1000;
 		FD_ZERO(&fds);
 		FD_SET(fd, &fds);
-		tv.tv_sec = SUSPEND_RUN;
-		tv.tv_usec = 0;
-		if (select(fd+1, &fds, 0, 0, &tv)) {
-			while (XPending(dpy))
-				if (XNextEvent(dpy, &ev))
-					running = 0; /* exit on error */
-				else if (handler[ev.type])
-					handler[ev.type](&ev); /* call handler */
-		}
-		runsuspend();
+		select(fd + 1, &fds, NULL, NULL, ms < 0 ? NULL : &tv);
 	}
 
 	unsuspend();
@@ -1687,6 +1725,12 @@ setmfact(const Arg *arg)
 	arrange(selmon);
 }
 
+static void
+sigterm(int unused)
+{
+	running = 0;
+}
+
 void
 setup(void)
 {
@@ -1700,6 +1744,12 @@ setup(void)
 	sa.sa_flags = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_RESTART;
 	sa.sa_handler = SIG_IGN;
 	sigaction(SIGCHLD, &sa, NULL);
+
+	/* exit cleanly on SIGTERM/SIGINT so stopped clients are resumed */
+	sa.sa_flags = 0;
+	sa.sa_handler = sigterm;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
 
 	/* clean up any zombies (inherited from .xinitrc etc) immediately */
 	while (waitpid(-1, NULL, WNOHANG) > 0);
@@ -1777,25 +1827,6 @@ seturgent(Client *c, int urg)
 	XFree(wmh);
 }
 
-static void
-unsuspendclient(Client *c)
-{
-	if (c->suspendstate == ALWAYS_ON)
-		return;
-
-	if (c->suspendstate >= PAUSED)
-		kill(-c->pgid, SIGCONT);
-
-	c->suspendstate = RUNNING;
-}
-
-static void
-suspendclient(Client *c)
-{
-	if (c->suspendstate == RUNNING)
-		c->suspendstate = STEPPING_1;
-}
-
 void
 showhide(Client *c)
 {
@@ -1803,7 +1834,8 @@ showhide(Client *c)
 		return;
 	if (ISVISIBLE(c)) {
 		/* show clients top down */
-		unsuspendclient(c);
+		c->hiddenat = 0;
+		contclient(c);
 		XMoveWindow(dpy, c->win, c->x, c->y);
 		if ((!c->mon->lt[c->mon->sellt]->arrange || c->isfloating) && !c->isfullscreen)
 			resize(c, c->x, c->y, c->w, c->h, 0);
@@ -1812,7 +1844,8 @@ showhide(Client *c)
 		/* hide clients bottom up */
 		showhide(c->snext);
 		XMoveWindow(dpy, c->win, WIDTH(c) * -2, c->y);
-		suspendclient(c);
+		if (!c->hiddenat)
+			c->hiddenat = nowms();
 	}
 }
 
@@ -1953,7 +1986,7 @@ unmanage(Client *c, int destroyed)
 	Monitor *m = c->mon;
 	XWindowChanges wc;
 
-	unsuspendclient(c);
+	contclient(c);
 	detach(c);
 	detachstack(c);
 	if (!destroyed) {

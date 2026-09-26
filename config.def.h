@@ -21,9 +21,11 @@ static const char *colors[][3]      = {
 /* tagging */
 static const char *tags[] = { "1", "2", "3", "4", "5", "6", "7", "8", "9" };
 
-/* suspend */
-#define SUSPEND_RUN     30  /* check every 30s */
-#define SUSPEND_PAUSED  300 /* suspend for 5min at a time */
+/* suspend: hidden suspendable clients are stopped, but resumed
+ * SUSPEND_RUN ms every SUSPEND_PERIOD ms to serve clipboard/D-Bus */
+#define SUSPEND_GRACE   30000 /* ms hidden before being suspended */
+#define SUSPEND_PERIOD  2000  /* ms */
+#define SUSPEND_RUN     100   /* ms */
 
 static const Rule rules[] = {
 	/* xprop(1):
